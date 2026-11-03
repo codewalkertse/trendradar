@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.7
 
 ### Fixed — 降级告警只说「哪个语言失败」，不说「为什么」
 - 现象：运行记录里只有「以下语言抓取失败，已跳过：python, typescript」或
