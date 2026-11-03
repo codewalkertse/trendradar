@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.6
+
+### Fixed — 手动「重新生成这一期」对已合并日期无效
+- `internal/app/run.go`：PR 预检由「已合并无条件跳过」改为「`Merged() && trigger != manual`
+  才跳过」。此前无论 manual/schedule，`--force` 都绕不过预检（force 仅清摘要缓存），
+  导致已合并日期永远无法重建。现在：schedule 仍不重开已定稿的一天；manual 继续重建，
+  `openPR` 的 `FindOpen`（state=open）对已合并 PR 返回 nil → 开新 PR。
+
+### Changed — 合并后清理分支（仅新合并）
+- `internal/pr/pr.go`：新增 `Client.DeleteBranch`（`DELETE /git/refs/heads/<branch>`，
+  404/422 视为幂等成功）。
+- `internal/gitx/git.go`：新增 `Git.DeleteLocalBranch`（`git branch -D`，缺失不算错）。
+- `internal/app/run.go`：`openPR` 后若确认已合并（新增 `branchMerged`），删除远端分支 +
+  切回 base 后删本地分支，数据仓只留 base 分支。仅确认合并才删；`autoMerge` 关（PR 仍开）
+  不删；删除失败只 warn，不影响已交付。
+
+### 兼容性
+- 对外数据形状不变：`ipcSchema` / `digestSchema` = 2，contract 包不升级。
+- 语义补充：manual 重建仍走 append；内容与已合并版一致时 `SkipReason=unchanged`
+  （插件已展示「内容无变化」，不再误报「已合并跳过」）。
+- 已合并 PR 记录在 GitHub 永久存在；本版本仅在 manual 时不再因它跳过，并清理合并后的分支。
+
 ## 0.8.5
 
 ### Changed — 榜单文档改为「按请求语言分块」，`all` 单独成块
