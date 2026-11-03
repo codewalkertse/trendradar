@@ -92,3 +92,39 @@ func TestFindForBranchNone(t *testing.T) {
 		t.Fatalf("want nil, got %+v", p)
 	}
 }
+
+func TestDeleteBranch(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		shouldErr bool
+	}{
+		{"ok 204", 204, false},
+		{"already gone 422", 422, false},
+		{"not found 404", 404, false},
+		{"server error 500", 500, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodDelete {
+					t.Errorf("method = %s, want DELETE", r.Method)
+				}
+				if r.URL.Path != "/repos/acme/widgets/git/refs/heads/trending/daily/2026-10-30" {
+					t.Errorf("path = %q", r.URL.Path)
+				}
+				w.WriteHeader(c.status)
+			}))
+			t.Cleanup(srv.Close)
+			cl := New("acme", "widgets", "tok")
+			cl.BaseURL = srv.URL
+			err := cl.DeleteBranch(context.Background(), "trending/daily/2026-10-30")
+			if c.shouldErr && err == nil {
+				t.Fatalf("expected error for status %d", c.status)
+			}
+			if !c.shouldErr && err != nil {
+				t.Fatalf("unexpected error for status %d: %v", c.status, err)
+			}
+		})
+	}
+}

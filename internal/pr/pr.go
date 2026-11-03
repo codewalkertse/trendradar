@@ -171,3 +171,20 @@ func (c *Client) Merge(ctx context.Context, number int) error {
 	}
 	return nil
 }
+
+// DeleteBranch deletes a remote branch (refs/heads/<branch>). It is used after a
+// PR is confirmed merged so the repository is left with only the base branch.
+// A 422 (already gone / does not exist) is treated as success: the goal state is
+// "branch absent", so a missing branch is not an error. Other failures are
+// returned so the caller can warn without failing the whole run.
+func (c *Client) DeleteBranch(ctx context.Context, branch string) error {
+	path := fmt.Sprintf("/repos/%s/%s/git/refs/heads/%s", c.Owner, c.Repo, branch)
+	_, err := c.do(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "-> 422") || strings.Contains(err.Error(), "-> 404") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
