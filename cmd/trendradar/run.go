@@ -167,6 +167,7 @@ func runRunExec(args []string, started time.Time, asJSON *bool) error {
 		}
 		in.Repos, in.Degraded = res.Repos, res.Degraded
 		in.DegradedReason, in.DegradedLangs = res.DegradedReason, res.DegradedLangs
+		in.DegradedDetail = res.DegradedDetail
 		// Echo the requested languages and carry the per-page view so the digest
 		// sections by requested page (one "## <lang>" per selection, "all" kept
 		// whole). Both stay zero on the --input replay path above, which then

@@ -35,6 +35,11 @@ type Inputs struct {
 	Degraded       bool
 	DegradedReason string
 	DegradedLangs  []string
+	// DegradedDetail is the compact "lang=reason" list behind DegradedLangs
+	// ("python=timeout, typescript=status 429") or a one-line explanation when
+	// the degradation was not per-language. Empty for a clean run. It is
+	// appended to the degradation warnings so a run record says *why*.
+	DegradedDetail string
 	Date           string
 	Period         string
 	// Requested is the language list the caller asked to fetch (cfg.trending.
@@ -314,16 +319,11 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 				"%d/%d 仓库摘要降级为英文原文（模型不可用或返回无效结果）", degradedCount, len(repoDigests)))
 		}
 		switch in.DegradedReason {
-		case ingest.ReasonSearchFallback:
-			banners = append(banners, "> ⚠️ 本次为降级数据：趋势页抓取失败，已回退到 GitHub 搜索 API。搜索结果无「今日新增」增量（starsInPeriod 一律为 0），排序按总 star，仅供参考。\n")
-			rep.Warnings = append(rep.Warnings, "趋势页抓取失败，已回退到 GitHub 搜索 API：无今日新增增量（全部为 0），排序按总 star")
-		case ingest.ReasonHTMLPartial:
-			langs := "未知"
-			if len(in.DegradedLangs) > 0 {
-				langs = strings.Join(in.DegradedLangs, ", ")
+		case ingest.ReasonSearchFallback, ingest.ReasonHTMLPartial:
+			if banner, warning := ingestDegradation(in.DegradedReason, in.DegradedLangs, in.DegradedDetail); warning != "" {
+				banners = append(banners, banner)
+				rep.Warnings = append(rep.Warnings, warning)
 			}
-			banners = append(banners, fmt.Sprintf("> ⚠️ 本次为部分降级数据：以下语言抓取失败，未包含在本次榜单中：%s。其余语言为正常趋势数据。\n", langs))
-			rep.Warnings = append(rep.Warnings, fmt.Sprintf("以下语言抓取失败，已跳过：%s", langs))
 		}
 
 		coreV := ipc.Version
@@ -846,6 +846,30 @@ func languagesOf(repos []digest.RepoSnapshot) []string {
 		}
 	}
 	return out
+}
+
+// ingestDegradation turns an ingest outcome into the markdown banner and the run
+// warning shown on the runs page. The optional "（原因：…）" suffix is what makes a
+// degraded run diagnosable: without it, "抓取失败" cannot tell a GitHub rate
+// limit from a proxy timeout, and the two call for different responses.
+func ingestDegradation(reason string, langs []string, detail string) (banner, warning string) {
+	suffix := ""
+	if detail != "" {
+		suffix = "（原因：" + detail + "）"
+	}
+	switch reason {
+	case ingest.ReasonSearchFallback:
+		return "> ⚠️ 本次为降级数据：趋势页抓取失败，已回退到 GitHub 搜索 API。搜索结果无「今日新增」增量（starsInPeriod 一律为 0），排序按总 star，仅供参考。\n",
+			"趋势页抓取失败，已回退到 GitHub 搜索 API：无今日新增增量（全部为 0），排序按总 star" + suffix
+	case ingest.ReasonHTMLPartial:
+		list := "未知"
+		if len(langs) > 0 {
+			list = strings.Join(langs, ", ")
+		}
+		return fmt.Sprintf("> ⚠️ 本次为部分降级数据：以下语言抓取失败，未包含在本次榜单中：%s。其余语言为正常趋势数据。\n", list),
+			fmt.Sprintf("以下语言抓取失败，已跳过：%s%s", list, suffix)
+	}
+	return "", ""
 }
 
 // digestLanguages decides the digest's `languages` front matter. It prefers the

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — 降级告警只说「哪个语言失败」，不说「为什么」
+- 现象：运行记录里只有「以下语言抓取失败，已跳过：python, typescript」或
+  「趋势页抓取失败，已回退到 GitHub 搜索 API」，无法区分 429 限流、超时、连接重置
+  或页面改版，排障只能靠猜。
+- `internal/fetch`：`TrendingResult` 新增 `Failures []FailedLang`（`Lang` + 归一化的
+  `Reason`），失败语言按语言名排序以保证告警文本稳定；新增 `Summarize`，把错误收敛为
+  `status 429` / `timeout` / `EOF` / `connection reset` / `dns error`，无法归类则截断保留原文。
+- `internal/ingest`：`Result.DegradedDetail` 记录 `lang=reason` 列表；「页面抓到了但解析
+  不出条目」单独说明（页面结构可能变化），不再与网络失败混为一谈。
+- `internal/app`：降级告警追加「（原因：…）」；banner 文案不变。
+
+### 兼容性
+- `RunResult` 与契约形状不变（`warnings` 仍是 `[]string`），`ipcSchema` / `digestSchema` = 2。
+- 告警文本变长（新增「（原因：…）」后缀）；按整串匹配的消费方需改为前缀匹配。
+
 ## 0.8.6
 
 ### Fixed — 手动「重新生成这一期」对已合并日期无效

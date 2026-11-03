@@ -34,6 +34,12 @@ type Result struct {
 	// DegradedLangs lists languages that failed to fetch or produced no rows and
 	// were therefore dropped from this run. Empty for a clean run.
 	DegradedLangs []string
+	// DegradedDetail explains *why* the run degraded, as a compact
+	// "lang=reason" list ("python=timeout, typescript=status 429") or a single
+	// sentence when the failure is not per-language (e.g. the pages arrived but
+	// nothing parsed). Empty for a clean run. It is what turns "抓取失败" into a
+	// diagnosable warning.
+	DegradedDetail string
 	// ByPage is the per-page view used by the renderer to lay markdown out into
 	// one section per requested language. Keyed by page language ("all" = global
 	// page); repos under a key keep that page's order and are NOT de-duplicated
@@ -47,15 +53,42 @@ type Result struct {
 // as long as one language yields rows, that partial result is used (with
 // Degraded=true, reason html_partial) instead of discarding everything.
 func Ingest(ctx context.Context, c *fetch.Client, languages []string, since string) (Result, error) {
-	fr, err := c.FetchTrending(ctx, languages, since)
-	if err != nil || !fr.Any() {
+	fr, ferr := c.FetchTrending(ctx, languages, since)
+	if ferr != nil && ctx.Err() != nil {
+		// Cancellation is not a degradation: surface it instead of quietly
+		// switching to the search API.
+		return Result{}, ferr
+	}
+	if ferr != nil || !fr.Any() {
 		// Every language failed: fall back to the search API.
-		return fallback(ctx, c, languages, since)
+		res, err := fallback(ctx, c, languages, since)
+		if err != nil {
+			return res, err
+		}
+		res.DegradedDetail = fetch.SummarizeFailures(fr.Failures)
+		if res.DegradedDetail == "" {
+			res.DegradedDetail = "所有语言页均未取到内容"
+		}
+		return res, nil
 	}
 
 	repos, byPage, report, perr := parse.ParseAll(fr.Pages)
 	if perr != nil || len(repos) == 0 {
-		return fallback(ctx, c, languages, since)
+		res, err := fallback(ctx, c, languages, since)
+		if err != nil {
+			return res, err
+		}
+		// The pages did arrive, so this is a parser/shape problem rather than a
+		// network one. Saying which matters: the fix is completely different.
+		reason := "趋势页抓取成功但未解析出条目（页面结构可能已变化）"
+		if perr != nil {
+			reason = "趋势页内容解析失败：" + perr.Error()
+		}
+		if detail := fetch.SummarizeFailures(fr.Failures); detail != "" {
+			reason += "；同时以下语言抓取失败：" + detail
+		}
+		res.DegradedDetail = reason
+		return res, nil
 	}
 
 	// Languages that were requested but contributed no page are degraded even
@@ -66,6 +99,7 @@ func Ingest(ctx context.Context, c *fetch.Client, languages []string, since stri
 		res.Degraded = true
 		res.DegradedReason = ReasonHTMLPartial
 		res.DegradedLangs = degradedLangs
+		res.DegradedDetail = fetch.SummarizeFailures(fr.Failures)
 	}
 	return res, nil
 }
