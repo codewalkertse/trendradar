@@ -72,19 +72,30 @@ func ParseTrending(body []byte, pageLang string) ([]digest.RepoSnapshot, Stats, 
 
 // ParseAll parses every fetched page, de-duplicates across languages and builds
 // a parse report.
-func ParseAll(pages map[string][]byte) ([]digest.RepoSnapshot, digest.ParseReport, error) {
+//
+// It returns both a flat, cross-page de-duplicated slice (the first result —
+// the wire document's `repos`, ordered by rank) and a per-page view (ByPage —
+// keyed by the requested page language, in page order, WITHOUT cross-page
+// de-duplication). ByPage is what the renderer uses to lay the markdown out into
+// one section per requested language; see render.MarkdownWithBanners. Keeping
+// them separate means a repo that surfaces on both the global "all" page and a
+// language page appears once in the JSON but can still be shown under both
+// sections.
+func ParseAll(pages map[string][]byte) ([]digest.RepoSnapshot, map[string][]digest.RepoSnapshot, digest.ParseReport, error) {
 	langs := orderLanguages(pages)
+	byPage := make(map[string][]digest.RepoSnapshot, len(langs))
 	var all [][]digest.RepoSnapshot
 	var stats []Stats
 	for _, lang := range langs {
 		repos, st, err := ParseTrending(pages[lang], lang)
 		if err != nil {
-			return nil, digest.ParseReport{}, err
+			return nil, nil, digest.ParseReport{}, err
 		}
+		byPage[lang] = repos
 		all = append(all, repos)
 		stats = append(stats, st)
 	}
-	return Merge(all), Detect(stats, 0.20), nil
+	return Merge(all), byPage, Detect(stats, 0.20), nil
 }
 
 // repoHref finds the repository link inside the heading, skipping the login

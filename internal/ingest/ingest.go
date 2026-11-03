@@ -34,6 +34,12 @@ type Result struct {
 	// DegradedLangs lists languages that failed to fetch or produced no rows and
 	// were therefore dropped from this run. Empty for a clean run.
 	DegradedLangs []string
+	// ByPage is the per-page view used by the renderer to lay markdown out into
+	// one section per requested language. Keyed by page language ("all" = global
+	// page); repos under a key keep that page's order and are NOT de-duplicated
+	// across pages. It is nil for the search-fallback path, where there is no
+	// notion of a page (see fallback).
+	ByPage map[string][]digest.RepoSnapshot
 }
 
 // Ingest fetches trending pages, parses them, and falls back to the search API
@@ -47,7 +53,7 @@ func Ingest(ctx context.Context, c *fetch.Client, languages []string, since stri
 		return fallback(ctx, c, languages, since)
 	}
 
-	repos, report, perr := parse.ParseAll(fr.Pages)
+	repos, byPage, report, perr := parse.ParseAll(fr.Pages)
 	if perr != nil || len(repos) == 0 {
 		return fallback(ctx, c, languages, since)
 	}
@@ -55,7 +61,7 @@ func Ingest(ctx context.Context, c *fetch.Client, languages []string, since stri
 	// Languages that were requested but contributed no page are degraded even
 	// if the pages we did get parsed fine.
 	degradedLangs := append([]string(nil), fr.FailedLangs...)
-	res := Result{Repos: repos, Report: report}
+	res := Result{Repos: repos, ByPage: byPage, Report: report}
 	if len(degradedLangs) > 0 {
 		res.Degraded = true
 		res.DegradedReason = ReasonHTMLPartial
@@ -73,6 +79,9 @@ func fallback(ctx context.Context, c *fetch.Client, languages []string, since st
 			Err:     err,
 		}
 	}
+	// No page information on the search-fallback path: leave ByPage nil so the
+	// renderer groups by repo language (its legacy layout) and the digest is
+	// clearly marked degraded.
 	return Result{
 		Repos:          repos,
 		Report:         digest.ParseReport{Total: len(repos), Degraded: true},

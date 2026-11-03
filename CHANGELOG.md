@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.5
+
+### Changed — 榜单文档改为「按请求语言分块」，`all` 单独成块
+- `internal/render/markdown.go`：产出 `.md` 不再按「每个仓库自身主语言」分节，改为按
+  `trending.languages` 里**请求的每一页语言**分块（一页一块，顺序同请求列表）；`all`（全局
+  页）命中的仓库统一进单独 `## all` 块，不再按各自主语言拆散。空块保留（选了某语言但本次
+  0 条时仍输出该节空表）。同一仓库既在 `all` 页又在分语言页时，两块都列出（跨页允许重复）。
+- `internal/parse/parse.go`：`ParseAll` 额外返回按页视图 `byPage`（页 → 仓库，保页序、不跨页
+  去重）；扁平 `repos` 仍跨页去重，wire 文档结构不变。
+- `internal/app/run.go`：digest 的 `languages` 元数据改为**如实回显请求语言列表**（不再从
+  实际抓到的仓库反推，避免冒出用户没选的语言）；`--input` 重放路径仍回退旧的按主语言分块。
+- `internal/ingest/ingest.go` · `internal/render/files.go` · `cmd/trendradar/run.go`：透传按页视图并接线。
+
+### 兼容性
+- 对外数据形状不变：`ipcSchema` / `digestSchema` 仍为 2，`contract` 包不升级。
+- 语义变化：digest 的 `languages` 字段含义由「本次实际抓到的语言集合」改为「本次请求的语言
+  列表」。因 `languages` 参与 `contentHash` 基线，同一天重跑产生的 `contentHash` 会与旧版本
+  不同（属修正，历史已落盘文件不重算）。
+- 历史 md（旧版按主语言分块）与新 md（按请求页分块）可共存于同一 `digests/` 下，格式兼容。
+
 ## 0.8.4
 
 ### Fixed — 趋势抓取失败导致整批退化、每语言仅零星几条且「今日新增」全为 0

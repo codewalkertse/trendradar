@@ -37,6 +37,17 @@ type Inputs struct {
 	DegradedLangs  []string
 	Date           string
 	Period         string
+	// Requested is the language list the caller asked to fetch (cfg.trending.
+	// languages, in order). When non-empty it is echoed verbatim into the
+	// digest's `languages` front matter so the document matches what the user
+	// selected instead of being reverse-derived from whatever repos were seen.
+	// Empty on the --input replay path, which falls back to languagesOf(Repos).
+	Requested []string
+	// ByPage is the per-page view (page language -> repos) used to section the
+	// markdown: one "## <lang>" block per requested language, with "all" kept as
+	// a single block. Nil on the --input replay path or search fallback, where
+	// the renderer falls back to the legacy per-repo-language layout.
+	ByPage map[string][]digest.RepoSnapshot
 }
 
 // Trigger says who asked for the run. It only changes the PR lifecycle policy:
@@ -321,7 +332,7 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 			Schema:          2,
 			Date:            in.Date,
 			Period:          period,
-			Languages:       languagesOf(in.Repos),
+			Languages:       digestLanguages(in),
 			Count:           len(repoDigests),
 			Degraded:        in.Degraded || summaryDegraded,
 			ContentHashAlgo: "jcs-sha256-v1",
@@ -331,13 +342,18 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 		}
 		d.ContentHash = render.ContentHash(d)
 
+		// Rebuild the per-page view over the *digested* repos (with summaries) so
+		// the renderer can section by requested page. Nil stays nil (replay /
+		// fallback), which makes the renderer use the legacy layout.
+		byPage := digestByPage(in.ByPage, repoDigests)
+
 		// Index history: scan the checked-out branch for prior digests so index.md
 		// accumulates instead of being rewritten to a single day. The repo is the
 		// source of truth, so read from cfg.Repo.Path (dry runs may have no cfg).
 		history, _ := render.ListDigests(historyRoot, limits)
 		merged := mergeDigests(history, d)
 
-		built, berr := render.BuildWithBanners(d, merged, limits, outDir, banners)
+		built, berr := render.BuildWithBanners(d, byPage, merged, limits, outDir, banners)
 		if berr != nil {
 			return res, berr
 		}
@@ -788,6 +804,48 @@ func languagesOf(repos []digest.RepoSnapshot) []string {
 			seen[r.Language] = true
 			out = append(out, r.Language)
 		}
+	}
+	return out
+}
+
+// digestLanguages decides the digest's `languages` front matter. It prefers the
+// caller's requested list (echoed verbatim, in order) so the document matches
+// what the user actually selected rather than being reverse-derived from the
+// repos that happened to surface. On the --input replay path (Requested empty)
+// it falls back to languagesOf for backward compatibility.
+func digestLanguages(in Inputs) []string {
+	if len(in.Requested) > 0 {
+		return append([]string(nil), in.Requested...)
+	}
+	return languagesOf(in.Repos)
+}
+
+// digestByPage re-keys the per-page snapshot view onto the summarized digest
+// repos so the renderer can section by requested page while still carrying each
+// repo's SummaryZh. Returns nil when there is no page information (replay /
+// search fallback), which tells the renderer to use its legacy layout.
+func digestByPage(byPage map[string][]digest.RepoSnapshot, digests []digest.RepoDigest) map[string][]digest.RepoDigest {
+	if byPage == nil {
+		return nil
+	}
+	byName := make(map[string]digest.RepoDigest, len(digests))
+	for _, d := range digests {
+		byName[d.FullName] = d
+	}
+	out := make(map[string][]digest.RepoDigest, len(byPage))
+	for lang, repos := range byPage {
+		list := make([]digest.RepoDigest, 0, len(repos))
+		for _, r := range repos {
+			if d, ok := byName[r.FullName]; ok {
+				list = append(list, d)
+				continue
+			}
+			// Should not happen (every snapshot gets a digest), but degrade
+			// gracefully: render the snapshot with an empty summary rather than
+			// dropping the row from its section.
+			list = append(list, digest.RepoDigest{RepoSnapshot: r})
+		}
+		out[lang] = list
 	}
 	return out
 }
