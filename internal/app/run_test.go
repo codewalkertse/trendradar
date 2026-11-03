@@ -215,10 +215,17 @@ type fakePR struct {
 	createdErr error
 	merged     []int
 	creates    int
+	deleted    []string
+	// latestAfterCreate, when set, is what FindForBranch returns once a PR has
+	// been created — lets a test model "the new PR exists in some state".
+	latestAfterCreate *pr.Pull
 }
 
 func (f *fakePR) FindOpen(context.Context, string, string) (*pr.Pull, error) { return f.existing, nil }
 func (f *fakePR) FindForBranch(context.Context, string, string) (*pr.Pull, error) {
+	if f.creates > 0 && f.latestAfterCreate != nil {
+		return f.latestAfterCreate, nil
+	}
 	return f.latest, nil
 }
 func (f *fakePR) Create(context.Context, string, string, string, string) (*pr.Pull, error) {
@@ -233,6 +240,10 @@ func (f *fakePR) Update(context.Context, int, string, string) (*pr.Pull, error) 
 }
 func (f *fakePR) Merge(_ context.Context, n int) error {
 	f.merged = append(f.merged, n)
+	return nil
+}
+func (f *fakePR) DeleteBranch(_ context.Context, branch string) error {
+	f.deleted = append(f.deleted, branch)
 	return nil
 }
 
@@ -354,23 +365,90 @@ func TestPRFailureRetriedWithoutNewCommit(t *testing.T) {
 	}
 }
 
-// Regression (C3): a date whose PR was already merged must be skipped entirely,
-// not re-pushed and re-opened as a duplicate.
-func TestMergedPRSkipsWholeRun(t *testing.T) {
+// Regression (C3): a *scheduled* run on a date whose PR was already merged must
+// be skipped — automation must not reopen a finished day. A manual
+// "regenerate this period" run is an explicit request and rebuilds (see
+// TestMergedPRRebuildsOnManualTrigger).
+func TestMergedPRSkipsScheduledRun(t *testing.T) {
 	remote, _, cfg := setupRepo(t)
 	cfg.PR = config.PRConfig{Enabled: true, AutoMerge: true}
 	mergedAt := time.Now()
 	withPRClient(t, &fakePR{latest: &pr.Pull{Number: 5, State: "closed", MergedAt: &mergedAt}})
 
-	r, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake(), Token: "tok"})
+	r, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake(), Token: "tok", Trigger: TriggerSchedule})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !r.Skipped {
-		t.Fatal("a date with a merged PR must be skipped")
+	if !r.Skipped || r.SkipReason != "merged" {
+		t.Fatalf("Skipped=%v reason=%q, want skipped/merged", r.Skipped, r.SkipReason)
 	}
 	if got := countRef(t, remote, "trending/daily/2026-10-30"); got != 0 {
 		t.Fatalf("unexpected branch pushed for merged date: %d commits", got)
+	}
+}
+
+// A manual run on a date whose PR was already merged must rebuild and open a
+// fresh PR (the old one is merged, so FindOpen sees nothing and Create runs).
+// Because the rebuilt PR is auto-merged, the branch is then cleaned up.
+func TestMergedPRRebuildsOnManualTrigger(t *testing.T) {
+	_, _, cfg := setupRepo(t)
+	cfg.PR = config.PRConfig{Enabled: true, AutoMerge: true}
+	mergedAt := time.Now()
+	created := &pr.Pull{Number: 9, HTMLURL: "https://github.com/acme/widgets/pull/9"}
+	mergedNew := &pr.Pull{Number: 9, State: "closed", MergedAt: &mergedAt}
+	fake := &fakePR{
+		latest:            &pr.Pull{Number: 5, State: "closed", MergedAt: &mergedAt},
+		created:           created,
+		latestAfterCreate: mergedNew,
+	}
+	withPRClient(t, fake)
+
+	r, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake(), Token: "tok", Trigger: TriggerManual})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if r.Skipped {
+		t.Fatalf("a manual run on a merged date must rebuild, got skip=%q", r.SkipReason)
+	}
+	if fake.creates != 1 {
+		t.Fatalf("expected a fresh PR to be created, creates=%d", fake.creates)
+	}
+	if r.PRURL != created.HTMLURL {
+		t.Fatalf("PRURL = %q, want %q", r.PRURL, created.HTMLURL)
+	}
+	// The rebuilt PR auto-merges, so the branch is deleted via the API and the
+	// local branch is removed too.
+	if len(fake.deleted) != 1 || fake.deleted[0] != "trending/daily/2026-10-30" {
+		t.Fatalf("branch was not deleted via API: %v", fake.deleted)
+	}
+}
+
+// With autoMerge off, the rebuilt PR stays open: the branch must NOT be deleted.
+func TestMergedPRRebuildKeepsBranchWhenNotMerged(t *testing.T) {
+	remote, _, cfg := setupRepo(t)
+	cfg.PR = config.PRConfig{Enabled: true, AutoMerge: false}
+	mergedAt := time.Now()
+	created := &pr.Pull{Number: 12, HTMLURL: "https://github.com/acme/widgets/pull/12"}
+	// Old PR merged (manual rebuilds); new PR open (not merged) → no cleanup.
+	fake := &fakePR{
+		latest:            &pr.Pull{Number: 5, State: "closed", MergedAt: &mergedAt},
+		created:           created,
+		latestAfterCreate: &pr.Pull{Number: 12, State: "open"},
+	}
+	withPRClient(t, fake)
+
+	r, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake(), Token: "tok", Trigger: TriggerManual})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if r.Skipped {
+		t.Fatalf("manual rebuild must not skip, got %q", r.SkipReason)
+	}
+	if len(fake.deleted) != 0 {
+		t.Fatalf("branch must not be deleted when PR is not merged: %v", fake.deleted)
+	}
+	if got := countRef(t, remote, "trending/daily/2026-10-30"); got == 0 {
+		t.Fatalf("branch should still exist when PR is open")
 	}
 }
 

@@ -481,9 +481,14 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 	branch := prefix + period + "/" + name
 
 	// PR lifecycle pre-check, before any git work:
-	//   merged            -> the date is done, skip;
-	//   closed + schedule -> a human said no; an automated run must not reopen it;
-	//   closed + manual   -> explicit request, rebuild/reopen.
+	//   merged + schedule  -> the date is done, skip (automation must not re-open
+	//                         a finished day, and the merged PR record persists in
+	//                         GitHub even after the branch is deleted);
+	//   merged + manual    -> explicit "regenerate this period" request: rebuild
+	//                         and open a fresh PR. The old PR stays merged, so
+	//                         openPR's FindOpen sees nothing and Create runs;
+	//   closed + schedule  -> a human said no; an automated run must not reopen it;
+	//   closed + manual    -> explicit request, rebuild/reopen.
 	prRequested := cfg.PR.Enabled && opts.Token != ""
 	var prClient prAPI
 	if prRequested {
@@ -495,7 +500,7 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 			switch {
 			case lerr != nil:
 				rep.Warnings = append(rep.Warnings, "PR: "+lerr.Error())
-			case latest.Merged():
+			case latest.Merged() && trigger != TriggerManual:
 				res.Skipped = true
 				res.SkipReason = "merged"
 				rep.TotalMs = since(start)
@@ -508,6 +513,8 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 				res.Report = rep
 				return res, nil
 			default:
+				// Includes merged + manual: rebuild the branch and let openPR open
+				// a fresh PR (FindOpen returns nil for a merged/absent open PR).
 				prClient = c
 			}
 		}
@@ -637,6 +644,26 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 		if werr != nil {
 			rep.Warnings = append(rep.Warnings, "PR: "+werr.Error())
 		}
+		// Once the branch's PR is merged, drop the branch (remote + local) so the
+		// repository keeps only the base branch. Only a confirmed merge triggers
+		// this: an open (autoMerge off) or failed PR leaves its branch intact. A
+		// cleanup failure only warns — the digest is already merged and delivered.
+		if !opts.DryRun && res.PRURL != "" {
+			if merged, verr := branchMerged(ctx, prClient, branch, cfg.Repo.BaseBranch); verr == nil && merged {
+				if derr := prClient.DeleteBranch(ctx, branch); derr != nil {
+					rep.Warnings = append(rep.Warnings, "branch cleanup (remote): "+derr.Error())
+				}
+				// Delete the local branch too; must switch off it first because git
+				// refuses to delete the current branch.
+				if serr := g.Switch(ctx, cfg.Repo.BaseBranch); serr == nil {
+					if derr := g.DeleteLocalBranch(ctx, branch); derr != nil {
+						rep.Warnings = append(rep.Warnings, "branch cleanup (local): "+derr.Error())
+					}
+				} else {
+					rep.Warnings = append(rep.Warnings, "branch cleanup (switch to base): "+serr.Error())
+				}
+			}
+		}
 	}
 
 	if relState != nil && relStatePath != "" && !opts.DryRun {
@@ -713,6 +740,7 @@ type prAPI interface {
 	Create(ctx context.Context, title, head, base, bodyText string) (*pr.Pull, error)
 	Update(ctx context.Context, number int, title, bodyText string) (*pr.Pull, error)
 	Merge(ctx context.Context, number int) error
+	DeleteBranch(ctx context.Context, branch string) error
 }
 
 var newPRClient = func(owner, repo, token string) prAPI { return pr.New(owner, repo, token) }
@@ -729,6 +757,18 @@ var newPRClientFor = func(ctx context.Context, g *gitx.Git, cfg *config.Config, 
 		return nil, err
 	}
 	return newPRClient(owner, repo, token), nil
+}
+
+// branchMerged reports whether the most recent PR for branch->base is merged.
+// Used after openPR to decide whether the branch can be cleaned up. A lookup
+// error is returned so the caller can skip cleanup (leave the branch intact)
+// rather than delete it on uncertainty.
+func branchMerged(ctx context.Context, client prAPI, branch, base string) (bool, error) {
+	latest, err := client.FindForBranch(ctx, branch, base)
+	if err != nil {
+		return false, err
+	}
+	return latest.Merged(), nil
 }
 
 func openPR(ctx context.Context, client prAPI, cfg *config.Config, branch string, d digest.Digest) (string, error) {

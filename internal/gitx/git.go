@@ -140,6 +140,20 @@ func (g *Git) Switch(ctx context.Context, branch string) error {
 	return err
 }
 
+// DeleteLocalBranch force-deletes a local branch. The caller must not be on that
+// branch (git refuses to delete the current branch); callers usually switch to
+// the base branch first. A missing branch is not an error (the goal is "absent").
+func (g *Git) DeleteLocalBranch(ctx context.Context, branch string) error {
+	_, stderr, err := g.run(ctx, "branch", "-D", branch)
+	if err != nil {
+		if strings.Contains(stderr, "not found") || strings.Contains(stderr, "no such branch") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // HeadSHA returns the current HEAD commit.
 func (g *Git) HeadSHA(ctx context.Context) (string, error) {
 	out, _, err := g.run(ctx, "rev-parse", "HEAD")
