@@ -307,3 +307,113 @@ func TestComparableIgnoresGeneratedAt(t *testing.T) {
 		t.Fatal("json comparable bytes must ignore generatedAt")
 	}
 }
+
+// perPageDigest builds a digest with three repos whose own languages differ from
+// the pages they were scraped from, so the sectioning test can prove sections
+// follow pages (not repo languages).
+func perPageDigest() (digest.Digest, map[string][]digest.RepoDigest) {
+	rd := func(name, repoLang string, rank int, summary string) digest.RepoDigest {
+		return digest.RepoDigest{
+			RepoSnapshot: digest.RepoSnapshot{FullName: name, URL: "https://github.com/" + name, Language: repoLang, Stars: 100, StarsInPeriod: 10, Rank: rank, Source: digest.SourceTrendingHTML},
+			SummaryZh:    summary, SummarySource: "model",
+		}
+	}
+	// Repo own languages: the C++ and Go repos came from the global "all" page;
+	// the Python repo came from the python page.
+	allA := rd("acme/hypr", "c++", 1, "全局榜里的 C++ 仓库")
+	allB := rd("acme/gocli", "go", 2, "全局榜里的 Go 仓库")
+	py := rd("acme/reqs", "python", 1, "python 页的仓库")
+
+	d := digest.Digest{
+		Schema:      2,
+		Date:        "2026-11-03",
+		Period:      "daily",
+		Languages:   []string{"all", "python", "rust"},
+		Count:       3,
+		Degraded:    false,
+		CoreVersion: digest.StrPtr("0.8.4"),
+	}
+	d.Repos = []digest.RepoDigest{allA, allB, py}
+	d.ContentHash = ContentHash(d)
+
+	byPage := map[string][]digest.RepoDigest{
+		"all":    {allA, allB},
+		"python": {py},
+		"rust":   {},
+	}
+	return d, byPage
+}
+
+// Sections must follow the requested pages: one "## all", one "## python", one
+// empty "## rust"; the all page stays whole (no "## c++" / "## go" split), and
+// the languages front matter echoes the requested list verbatim.
+func TestMarkdownSectionsFollowRequestedPages(t *testing.T) {
+	d, byPage := perPageDigest()
+	out := string(MarkdownWithBanners(d, byPage, nil))
+
+	for _, want := range []string{"## all", "## python", "## rust"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing section %q:\n%s", want, out)
+		}
+	}
+	// all page stays consolidated: no per-repo-language sections.
+	for _, bad := range []string{"## c++", "## go"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("unexpected per-repo-language section %q:\n%s", bad, out)
+		}
+	}
+	// empty rust section must still be present (header, empty table).
+	rustIdx := strings.Index(out, "## rust")
+	if rustIdx < 0 {
+		t.Fatalf("rust section missing:\n%s", out)
+	}
+	if strings.Contains(out[rustIdx:], "| [") {
+		t.Fatalf("rust section should be empty:\n%s", out[rustIdx:])
+	}
+	// front matter echoes requested languages.
+	if !strings.Contains(out, "languages: [all, python, rust]") {
+		t.Fatalf("front matter not echoing requested languages:\n%s", out)
+	}
+	// all-page repos appear under ## all (verify both names present before python).
+	allIdx := strings.Index(out, "## all")
+	pyIdx := strings.Index(out, "## python")
+	if allIdx < 0 || pyIdx < 0 || !(allIdx < pyIdx) {
+		t.Fatalf("section order wrong:\n%s", out)
+	}
+	allBody := out[allIdx:pyIdx]
+	if !strings.Contains(allBody, "acme/hypr") || !strings.Contains(allBody, "acme/gocli") {
+		t.Fatalf("all section missing its repos:\n%s", allBody)
+	}
+}
+
+// A repo present on both the "all" page and a language page must show up under
+// both sections (cross-page duplication is intentional per the design).
+func TestMarkdownAllowsCrossPageDuplication(t *testing.T) {
+	d, byPage := perPageDigest()
+	dup := byPage["all"][1] // acme/gocli, also pretend it trended on python
+	byPage["python"] = append(byPage["python"], dup)
+	out := string(MarkdownWithBanners(d, byPage, nil))
+
+	allIdx := strings.Index(out, "## all")
+	pyIdx := strings.Index(out, "## python")
+	rustIdx := strings.Index(out, "## rust")
+	if allIdx < 0 || pyIdx < 0 || rustIdx < 0 {
+		t.Fatalf("missing sections:\n%s", out)
+	}
+	if !strings.Contains(out[allIdx:pyIdx], "acme/gocli") || !strings.Contains(out[pyIdx:rustIdx], "acme/gocli") {
+		t.Fatalf("duplicated repo should appear in both all and python sections:\n%s", out)
+	}
+}
+
+// A nil byPage (replay / search fallback) keeps the legacy per-repo-language
+// layout, and sections still order with requested languages first.
+func TestMarkdownNilByPageFallsBackToRepoLanguage(t *testing.T) {
+	d, _ := perPageDigest()
+	out := string(MarkdownWithBanners(d, nil, nil))
+	// Legacy layout groups by repo language => c++ and go sections exist.
+	for _, want := range []string{"## c++", "## go", "## python"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("legacy layout missing %q:\n%s", want, out)
+		}
+	}
+}

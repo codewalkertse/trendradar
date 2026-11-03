@@ -19,7 +19,7 @@ func TestGoldenAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	repos, rep, err := ParseAll(map[string][]byte{"all": body})
+	repos, _, rep, err := ParseAll(map[string][]byte{"all": body})
 	if err != nil {
 		t.Fatalf("ParseAll: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestNoLoginAnchors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repos, _, err := ParseAll(map[string][]byte{"all": body})
+	repos, _, _, err := ParseAll(map[string][]byte{"all": body})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestMergeDedupKeepsBestRank(t *testing.T) {
 }
 
 func TestParseEmptyHTMLYieldsZero(t *testing.T) {
-	repos, rep, err := ParseAll(map[string][]byte{"all": []byte("<html><body>nothing</body></html>")})
+	repos, _, rep, err := ParseAll(map[string][]byte{"all": []byte("<html><body>nothing</body></html>")})
 	if err != nil {
 		t.Fatalf("ParseAll: %v", err)
 	}

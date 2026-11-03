@@ -634,3 +634,54 @@ func TestRunEnrichInjectsContext(t *testing.T) {
 		t.Fatalf("prompt leaked raw HTML from README:\n%s", joined)
 	}
 }
+
+func TestDigestLanguagesPrefersRequested(t *testing.T) {
+	// Requested wins verbatim (order preserved), even if repos imply other langs.
+	in := Inputs{
+		Repos:     []digest.RepoSnapshot{{FullName: "a/b", Language: "c++"}, {FullName: "a/c", Language: "go"}},
+		Requested: []string{"all", "python", "rust"},
+	}
+	got := digestLanguages(in)
+	want := []string{"all", "python", "rust"}
+	if !equalStrings(got, want) {
+		t.Fatalf("digestLanguages = %v, want %v", got, want)
+	}
+}
+
+func TestDigestLanguagesFallsBackToRepos(t *testing.T) {
+	// No Requested (replay path): fall back to languagesOf, which seeds "all".
+	in := Inputs{Repos: []digest.RepoSnapshot{{FullName: "a/b", Language: "go"}}}
+	got := digestLanguages(in)
+	if len(got) == 0 || got[0] != "all" || !contains(got, "go") {
+		t.Fatalf("digestLanguages fallback = %v, want all-prefixed with go", got)
+	}
+}
+
+func TestDigestByPageCarriesSummaries(t *testing.T) {
+	byPage := map[string][]digest.RepoSnapshot{
+		"all": {{FullName: "a/one", Language: "c++"}, {FullName: "a/two", Language: "go"}},
+	}
+	digests := []digest.RepoDigest{
+		{RepoSnapshot: digest.RepoSnapshot{FullName: "a/one"}, SummaryZh: "S1"},
+		{RepoSnapshot: digest.RepoSnapshot{FullName: "a/two"}, SummaryZh: "S2"},
+	}
+	got := digestByPage(byPage, digests)
+	if got == nil {
+		t.Fatal("digestByPage returned nil for non-nil input")
+	}
+	if len(got["all"]) != 2 || got["all"][0].SummaryZh != "S1" || got["all"][1].SummaryZh != "S2" {
+		t.Fatalf("digestByPage did not carry summaries: %+v", got["all"])
+	}
+	if digestByPage(nil, digests) != nil {
+		t.Fatal("nil byPage must stay nil (trigger legacy layout)")
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

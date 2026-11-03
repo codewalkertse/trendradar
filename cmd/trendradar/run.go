@@ -167,6 +167,12 @@ func runRunExec(args []string, started time.Time, asJSON *bool) error {
 		}
 		in.Repos, in.Degraded = res.Repos, res.Degraded
 		in.DegradedReason, in.DegradedLangs = res.DegradedReason, res.DegradedLangs
+		// Echo the requested languages and carry the per-page view so the digest
+		// sections by requested page (one "## <lang>" per selection, "all" kept
+		// whole). Both stay zero on the --input replay path above, which then
+		// falls back to the legacy layout.
+		in.Requested = cfg.Trending.Languages
+		in.ByPage = res.ByPage
 	}
 	if len(in.Repos) == 0 && !releasesOnly {
 		return fmt.Errorf("no repository snapshots to process")

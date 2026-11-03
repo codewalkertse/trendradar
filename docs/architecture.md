@@ -14,6 +14,7 @@
 | [订阅能力纳入契约（contract v0.3.0）](specs/2026-10-31-contract-releases-v3-design.md) | 已实施 | `releases.v2.json` 与 serve 发版接口（§6） |
 | [订阅数据版本化（方案 A）](specs/2026-10-31-subscription-repo-versioned-design.md) | 已实施 | 订阅从本机文件迁至数据仓 `<output.dir>/subscriptions.yaml`（§5、§7、§9） |
 | [订阅页与每周发版记录](specs/2026-11-01-subscriptions-weekly-releases-design.md) | 已实施（核心 0.7.0 / 契约 0.4.0） | 发版阶段改周粒度（一仓一周一次批量总结）、新增每仓文档与卷切分、`subscribe releases`、`run --stages releases`、HTTP 只读镜像（§2、§4、§6、§7） |
+| [榜单文档按请求语言分块 + all 特殊块](specs/2026-11-03-language-block-layout-design.md) | 草拟（待评审） | 产出的 `.md` 由「按仓库主语言分块」改为「按请求页语言分块」，`all` 单独成块；`Digest.Languages` 回显请求列表而非反推（§4 渲染、§5 采集） |
 
 ---
 
