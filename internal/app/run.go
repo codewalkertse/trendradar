@@ -145,7 +145,10 @@ type ReleasesOptions struct {
 
 // Result is the outcome of a run.
 type Result struct {
-	Digest     digest.Digest
+	Digest digest.Digest
+	// DigestPath is the repo-relative path of the markdown digest rendered by
+	// this run (empty when no digest was rendered: dry-run/merged/pr-closed).
+	DigestPath string
 	Files      []render.File
 	Report     Report
 	Skipped    bool
@@ -199,6 +202,42 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 	limits := map[string]int{"daily": 90, "weekly": 12, "monthly": 12}
 	var files []render.File
 	var d digest.Digest
+
+	// Sync the local base checkout before reading history for the index. The
+	// renderer's ListDigests (below) reads the *working tree* of whatever branch
+	// is checked out. Between runs the automation only `git switch`es back to the
+	// base branch (see the cleanup block at the end) and never pulls it, while
+	// the remote base keeps advancing as merged PRs land. Reading a stale base
+	// drops every date merged since the last pull: index.md loses rows for days
+	// already shipped. Fast-forward the local base first so the history scan sees
+	// the repo's truth. Must run before the digest render below.
+	if !opts.DryRun && cfg != nil {
+		base := cfg.Repo.BaseBranch
+		if base == "" {
+			base = "main"
+		}
+		remote := cfg.Repo.Remote
+		if remote == "" {
+			remote = "origin"
+		}
+		if serr := gitx.EnsureInstalled(); serr != nil {
+			return res, serr
+		}
+		g := gitx.New(cfg.Repo.Path)
+		if _, terr := g.Toplevel(ctx); terr != nil {
+			return res, terr
+		}
+		// Best-effort: a sync failure must not abort a run whose artifacts can
+		// still be rendered and pushed. It is surfaced as a warning, and the
+		// branch-level sync below retries the fast-forward before switching.
+		if ferr := g.Fetch(ctx, remote); ferr != nil {
+			rep.Warnings = append(rep.Warnings, "base sync (fetch): "+ferr.Error())
+		} else if cur, cerr := g.CurrentBranch(ctx); cerr == nil && cur == base {
+			if perr := g.PullFFOnly(ctx, remote, base); perr != nil {
+				rep.Warnings = append(rep.Warnings, "base sync (pull): "+perr.Error())
+			}
+		}
+	}
 
 	if wantsDigest {
 		sumStart := time.Now()
@@ -358,6 +397,16 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 			return res, berr
 		}
 		files = built
+		// Remember which artifact is the digest itself. The CLI inlines its bytes
+		// into RunResult so the consumer never has to read the output repository
+		// (the branch may already be merged and deleted by the time it looks).
+		digestName := render.NameOf(period, d.Date) + ".md"
+		for _, f := range files {
+			if strings.HasSuffix(f.Path, "/"+digestName) {
+				res.DigestPath = f.Path
+				break
+			}
+		}
 	} // end wantsDigest
 
 	// Optional repo-release subscription stage. Its artifacts are appended to
@@ -398,10 +447,10 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 		if rerr != nil {
 			rep.Warnings = append(rep.Warnings, "releases: "+rerr.Error())
 		} else {
-			// The document date follows the summary period, so a mid-week run and
-			// the Sunday run land on the same weekly files.
-			d.Date = drel.Date
-			d.Period = drel.Period
+			// drel.Date is the release document's week end; the trending digest d
+			// keeps its own date/period. Overwriting d here used to leak the
+			// release date into the PR title/body (a monthly run showing up as a
+			// weekly PR for next Sunday) and into Result.Digest.
 			if drel.Count > 0 {
 				coreV := ipc.Version
 				drel.CoreVersion = &coreV
@@ -488,17 +537,41 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 		branch = prefix + d.Date
 	}
 
+	// Fast-forward the local base before deriving a new date branch from it. A
+	// prior run that ended by auto-merging (and so skipped the cleanup block) or
+	// a run that never got as far as cleanup leaves the local base behind the
+	// remote; branching from a stale remote/base would omit dates already merged
+	// upstream. Only when we are actually on base — switching away from a date
+	// branch is handled when that branch is (re)created below.
+	if cur, cerr := g.CurrentBranch(ctx); cerr == nil && cur == base {
+		if perr := g.PullFFOnly(ctx, remote, base); perr != nil {
+			return res, perr
+		}
+	}
+
 	// PR lifecycle pre-check, before any git work:
 	//   merged + schedule  -> the date is done, skip (automation must not re-open
 	//                         a finished day, and the merged PR record persists in
 	//                         GitHub even after the branch is deleted);
 	//   merged + manual    -> explicit "regenerate this period" request: rebuild
-	//                         and open a fresh PR. The old PR stays merged, so
-	//                         openPR's FindOpen sees nothing and Create runs;
+	//                         the branch from base (force-with-lease) and open a
+	//                         fresh PR. The old PR stays merged, so openPR's
+	//                         FindOpen sees nothing and Create runs;
 	//   closed + schedule  -> a human said no; an automated run must not reopen it;
 	//   closed + manual    -> explicit request, rebuild/reopen.
 	prRequested := cfg.PR.Enabled && opts.Token != ""
 	var prClient prAPI
+	// rebuildFromBase marks a manual regenerate of a date whose branch is already
+	// spent (its PR was merged or closed). Appending to such a branch diverges
+	// from a squash-merged base — the two sides touch the same digest files and
+	// the new PR can never merge. Those runs delete the spent branch and recreate
+	// it from base (see the checkout block below).
+	rebuildFromBase := false
+	// rebuildNeedsForce is set only when deleting the remote spent branch failed:
+	// the ref is still there, so a plain push cannot fast-forward and the push
+	// step must fall back to force-with-lease. In the normal path it stays false
+	// and the rebuild ends with a plain push.
+	rebuildNeedsForce := false
 	if prRequested {
 		c, cerr := newPRClientFor(ctx, g, cfg, opts.Token)
 		if cerr != nil {
@@ -524,14 +597,17 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 				// Includes merged + manual: rebuild the branch and let openPR open
 				// a fresh PR (FindOpen returns nil for a merged/absent open PR).
 				prClient = c
+				rebuildFromBase = trigger == TriggerManual && (latest.Merged() || latest.ClosedUnmerged())
 			}
 		}
 	}
 
-	// Append-only branches: reuse what exists instead of resetting from the base.
-	// A reset made every rerun a rewritten branch (hence the old force-with-lease);
-	// appending means a plain push is always a fast-forward and nothing a human
-	// committed on the branch is ever clobbered.
+	// Branch lifecycle:
+	//   - spent branch + manual rebuild → delete the branch (remote + local) and
+	//     recreate it from base so the push is a plain fast-forward (below);
+	//   - otherwise append-only: reuse what exists instead of resetting from the
+	//     base, so a plain push is always a fast-forward and nothing a human
+	//     committed on the branch is clobbered.
 	hasLocal, err := g.HasRef(ctx, "refs/heads/"+branch)
 	if err != nil {
 		return res, err
@@ -541,6 +617,34 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 		return res, err
 	}
 	switch {
+	case rebuildFromBase:
+		// Rebuild cleanly: drop the spent branch on both sides, then branch
+		// afresh from base. A plain push of a from-base branch is a fast-forward
+		// on the remote (the old ref is gone), so we never need force-push in the
+		// normal path. Deleting the remote branch also leaves the repo with only
+		// the branches it should have — a spent branch is not kept around.
+		//
+		// Guard: never touch the base branch itself. If branch==base a delete or
+		// reset would wipe the repository's trunk; treat that as a hard error.
+		if branch == base {
+			return res, fmt.Errorf("app: refusing to rebuild %q: it is the base branch %q", branch, base)
+		}
+		// Delete the remote branch first so the subsequent push has no ref to
+		// be non-fast-forward against. If deletion fails (e.g. a protected-branch
+		// rule still guards it, or a race), we fall back to force-with-lease at
+		// push time — that is now the exception, not the rule.
+		if hasRemote {
+			if derr := g.DeleteRemoteBranch(ctx, remote, branch, opts.Token); derr != nil {
+				rep.Warnings = append(rep.Warnings, "rebuild: delete remote branch: "+derr.Error())
+				// Keep going; pushForceFallback above handles a still-present ref.
+				rebuildNeedsForce = true
+			}
+		}
+		// Recreating the local branch from base via switch -C resets it, so a
+		// stale local copy cannot re-introduce the deleted history.
+		if err := g.SwitchCreate(ctx, branch, remote+"/"+base); err != nil {
+			return res, err
+		}
 	case hasLocal:
 		if err := g.Switch(ctx, branch); err != nil {
 			return res, err
@@ -620,8 +724,28 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 		if sha, err := g.HeadSHA(ctx); err == nil {
 			res.Commit = sha
 		}
-		if err := pushWithRetry(ctx, g, remote, branch, opts.Token); err != nil {
-			return res, pushFailure(err, branch, remote)
+		var perr error
+		if rebuildFromBase {
+			// Preferred: a plain push. Because the remote branch was deleted above
+			// and we recreated the local branch from base, this is a fast-forward
+			// on a ref that no longer exists — exactly what an append-only push
+			// looks like. Only when the delete failed (rebuildNeedsForce) is the
+			// remote ref still there and a force-with-lease needed to replace it.
+			if rebuildNeedsForce {
+				perr = pushForceWithRetry(ctx, g, remote, branch, opts.Token)
+			} else {
+				perr = g.Push(ctx, remote, branch, opts.Token)
+				if perr != nil && gitx.PushRejected(perr) {
+					// The remote ref lingered (delete raced / was recreated):
+					// fall back to force-with-lease as a bounded recovery.
+					perr = pushForceWithRetry(ctx, g, remote, branch, opts.Token)
+				}
+			}
+		} else {
+			perr = pushWithRetry(ctx, g, remote, branch, opts.Token)
+		}
+		if perr != nil {
+			return res, pushFailure(perr, branch, remote)
 		}
 		pushed = true
 	}
@@ -662,10 +786,17 @@ func Run(ctx context.Context, cfg *config.Config, in Inputs, opts Options) (Resu
 					rep.Warnings = append(rep.Warnings, "branch cleanup (remote): "+derr.Error())
 				}
 				// Delete the local branch too; must switch off it first because git
-				// refuses to delete the current branch.
+				// refuses to delete the current branch. After switching to base,
+				// fast-forward it so the next run's history scan starts from an
+				// up-to-date working tree (see the start-of-run base sync above:
+				// cleanup used to switch without pulling, so back-to-back runs read
+				// a stale base and dropped merged dates from index.md).
 				if serr := g.Switch(ctx, cfg.Repo.BaseBranch); serr == nil {
 					if derr := g.DeleteLocalBranch(ctx, branch); derr != nil {
 						rep.Warnings = append(rep.Warnings, "branch cleanup (local): "+derr.Error())
+					}
+					if perr := g.PullFFOnly(ctx, remote, cfg.Repo.BaseBranch); perr != nil {
+						rep.Warnings = append(rep.Warnings, "branch cleanup (pull base): "+perr.Error())
 					}
 				} else {
 					rep.Warnings = append(rep.Warnings, "branch cleanup (switch to base): "+serr.Error())
@@ -703,6 +834,21 @@ func filesMatch(files []render.File, repoPath string) bool {
 		}
 	}
 	return true
+}
+
+// pushForceWithRetry force-replaces the remote branch (force-with-lease) for an
+// intentional rebuild from base. A rejected lease means the remote moved after
+// our fetch: refetch and retry once. The force is bounded to the branch we just
+// recreated from base, never to an open PR's in-flight history.
+func pushForceWithRetry(ctx context.Context, g *gitx.Git, remote, branch, token string) error {
+	err := g.PushForce(ctx, remote, branch, token)
+	if err == nil || !gitx.PushRejected(err) {
+		return err
+	}
+	if ferr := g.Fetch(ctx, remote); ferr != nil {
+		return err
+	}
+	return g.PushForce(ctx, remote, branch, token)
 }
 
 // pushWithRetry pushes and, when the remote moved under us, rebases once onto
@@ -745,6 +891,7 @@ func pushFailure(err error, branch, remote string) error {
 type prAPI interface {
 	FindOpen(ctx context.Context, head, base string) (*pr.Pull, error)
 	FindForBranch(ctx context.Context, head, base string) (*pr.Pull, error)
+	Get(ctx context.Context, number int) (*pr.Pull, error)
 	Create(ctx context.Context, title, head, base, bodyText string) (*pr.Pull, error)
 	Update(ctx context.Context, number int, title, bodyText string) (*pr.Pull, error)
 	UpdateBody(ctx context.Context, number int, bodyText string) (*pr.Pull, error)
@@ -789,33 +936,69 @@ func openPR(ctx context.Context, client prAPI, cfg *config.Config, branch string
 	if err != nil {
 		return "", err
 	}
+	var (
+		num int
+		url string
+	)
 	if existing == nil {
-		p, err := client.Create(ctx, title, branch, cfg.Repo.BaseBranch, bodyText)
-		if err != nil {
-			return "", err
+		p, cerr := client.Create(ctx, title, branch, cfg.Repo.BaseBranch, bodyText)
+		if cerr != nil {
+			return "", cerr
 		}
-		// A freshly created PR must also honour autoMerge. Previously only the
-		// "existing PR" path merged, so the first PR of a run was left open.
-		if cfg.PR.AutoMerge {
-			if err := client.Merge(ctx, p.Number); err != nil {
-				return p.HTMLURL, err
+		num, url = p.Number, p.HTMLURL
+	} else {
+		// Keep the title the first period gave this PR: with branchGrouping per-date
+		// all periods share one branch and one PR, and re-sending the title renamed
+		// it after whichever period ran last.
+		p, uerr := client.UpdateBody(ctx, existing.Number, bodyText)
+		if uerr != nil {
+			return "", uerr
+		}
+		num, url = p.Number, p.HTMLURL
+	}
+	// A freshly created PR must also honour autoMerge (previously only the
+	// "existing PR" path merged, so the first PR of a run was left open).
+	if cfg.PR.AutoMerge {
+		// Never fire PUT /merge at a PR GitHub has already determined is not
+		// mergeable: it just 405s and the caller reports a failure, while the
+		// useful outcome (a PR left open for a human) is identical. Re-read the
+		// PR first because list projections often return mergeable=null; when it
+		// is positively false, leave the PR open and warn with the reason.
+		mergeable, merr := mergeableNow(ctx, client, num)
+		if merr != nil {
+			return url, merr
+		}
+		if mergeable != nil && !*mergeable {
+			state := ""
+			if fresh, gerr := client.Get(ctx, num); gerr == nil && fresh != nil {
+				state = fresh.MergeableState
+			}
+			return url, &ipc.ErrorInfo{
+				Code:      ipc.CodeNotMergeable,
+				Message:   fmt.Sprintf("PR #%d left open: not mergeable (state=%q); not attempting merge", num, state),
+				Retriable: false,
 			}
 		}
-		return p.HTMLURL, nil
-	}
-	// Keep the title the first period gave this PR: with branchGrouping per-date
-	// all periods share one branch and one PR, and re-sending the title renamed
-	// it after whichever period ran last.
-	p, err := client.UpdateBody(ctx, existing.Number, bodyText)
-	if err != nil {
-		return "", err
-	}
-	if cfg.PR.AutoMerge {
-		if err := client.Merge(ctx, existing.Number); err != nil {
-			return p.HTMLURL, err
+		if err := client.Merge(ctx, num); err != nil {
+			return url, err
 		}
 	}
-	return p.HTMLURL, nil
+	return url, nil
+}
+
+// mergeableNow returns the PR's current mergeable flag, re-reading the single PR
+// to settle a null that the create/update list projection often leaves behind.
+// A nil return means GitHub has still not computed it — callers proceed and let
+// the merge call itself decide (a 405 there is still mapped by pr.Client.Merge).
+func mergeableNow(ctx context.Context, client prAPI, number int) (*bool, error) {
+	fresh, err := client.Get(ctx, number)
+	if err != nil {
+		return nil, err
+	}
+	if fresh == nil {
+		return nil, nil
+	}
+	return fresh.Mergeable, nil
 }
 
 func commitMessage(cfg *config.Config, period, name string) string {

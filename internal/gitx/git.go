@@ -91,11 +91,21 @@ func (g *Git) Commit(ctx context.Context, message, name, email string) error {
 // is fed through a temporary GIT_ASKPASS helper (0600, removed after), never via
 // argv.
 //
-// The automation never force-pushes: per-date branches are append-only, so a
-// rejected push means the remote moved and the caller should fetch + rebase +
-// retry once (see app.pushWithRetry).
+// Per-date branches are append-only, so a rejected push means the remote moved
+// and the caller should fetch + rebase + retry once (see app.pushWithRetry).
+// The single exception is PushForce, used only when a spent branch is
+// intentionally recreated from base.
 func (g *Git) Push(ctx context.Context, remote, branch, token string) error {
 	return g.push(ctx, []string{"push", "-u", remote, branch}, token)
+}
+
+// PushForce replaces the remote branch using force-with-lease. It is now only a
+// fallback for the manual rebuild: the primary path deletes the spent remote
+// branch (DeleteRemoteBranch) and recreates it from base, so a plain push is a
+// fast-forward. Force-with-lease is used only when that delete failed and the
+// ref is still present. The lease keeps it safe if someone else pushed meanwhile.
+func (g *Git) PushForce(ctx context.Context, remote, branch, token string) error {
+	return g.push(ctx, []string{"push", "--force-with-lease", "-u", remote, branch}, token)
 }
 
 func (g *Git) push(ctx context.Context, args []string, token string) error {
@@ -210,6 +220,17 @@ func (g *Git) PullRebase(ctx context.Context, remote, branch string) error {
 	return err
 }
 
+// PullFFOnly fast-forwards the current branch onto remote/branch, refusing to
+// create a merge commit or rebase. It is how the automation keeps its local base
+// checkout current: the repo is only ever appended to on the base branch, so a
+// fast-forward is the only correct sync. A non-fast-forward (local commits on
+// base, or a force-pushed remote) is returned as an error rather than silently
+// diverging — the caller surfaces it and the next run retries.
+func (g *Git) PullFFOnly(ctx context.Context, remote, branch string) error {
+	_, _, err := g.run(ctx, "pull", "--ff-only", remote, branch)
+	return err
+}
+
 func writeAskpass(token string) (string, func(), error) {
 	dir, err := os.MkdirTemp("", "trendradar-askpass-*")
 	if err != nil {
@@ -223,6 +244,26 @@ func writeAskpass(token string) (string, func(), error) {
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	return script, cleanup, nil
+}
+
+// DeleteRemoteBranch deletes a branch on the remote (git push <remote> --delete
+// <branch>). A missing branch is not an error: the goal is "branch absent", so
+// the caller can then recreate it from base with a plain push. Errors carry the
+// remote stderr so the caller can decide whether to fall back to force-push
+// (e.g. a remote that rejects deletion but accepts a force rewind).
+func (g *Git) DeleteRemoteBranch(ctx context.Context, remote, branch, token string) error {
+	err := g.push(ctx, []string{"push", remote, "--delete", branch}, token)
+	if err == nil {
+		return nil
+	}
+	var ge *Error
+	if errors.As(err, &ge) {
+		msg := strings.ToLower(ge.Message)
+		if strings.Contains(msg, "remote ref does not exist") {
+			return nil
+		}
+	}
+	return err
 }
 
 // RemoteURL returns the URL configured for a remote.

@@ -17,6 +17,41 @@
 - 契约未改：`contract/` 无改动，`ipcSchema` / `digestSchema` = 2。
 - 配置走非严格 YAML 解析，旧核心收到该键会忽略、不报错。
 
+## 0.9.1
+
+### Fixed — 手动重建已合并日期时，PR 永久冲突
+- 现象：对已合并的日期点「重新生成这一期」，core 复用旧分支 append；主分支是
+  squash 合并（同一批文件有新提交），分支仍基于旧 base → 新 PR 永远 `CONFLICTING`，
+  只能手工关掉再删分支。
+- `internal/app`：manual 触发且该分支的 PR 已 merged / closed（分支已花掉）时，
+  改成从 `origin/<base>` 重建分支（`switch -C`）并 `--force-with-lease` 推送；
+  open PR 仍保持 append（不重写在审历史），schedule 行为不变。
+- `internal/gitx`：新增 `PushForce`（仅用于这条重建路径）。
+
+### Fixed — 发版阶段覆盖了榜单 digest 的日期 / 周期
+- `internal/app`：`releasewatch` 的 `drel.Date` / `drel.Period` 不再写回 trending 的
+  `d`。此前同时启用订阅的组合运行会把 PR 标题/正文写成 release 文档的「周末 +
+  weekly」（月榜 PR 显示成 `trending weekly 2026-11-08`），也污染 `Result.Digest`。
+
+## 0.9.0
+
+### Changed — 榜单文档随 `RunResult` 回传（ipc v3）
+- 背景：插件原先在运行结束后**读用户仓库的工作树**取本期 digest 做预览。0.8.6 起 PR 自动合并后会
+  切回 base 并删除分支，本地 base 往往落后于远端，导致读到的文件缺失或还是旧版，预览被静默跳过
+  （表现：面板里周/月榜长期停留在旧副本，缺少新排版里的 `## all` 分块）。
+- `contract` 0.6.0：`ipcSchema` 2 → 3；`RunResult` 新增可选 `digest`
+  `{path, bytes, sha256, text}`，即本次渲染出的 markdown 原文。`bytes`/`sha256` 与 `text` 的
+  UTF-8 字节一致，`text` 上限 1 MiB。凡是渲染出 digest 的运行都会带（含 `skipped=unchanged`、
+  `merged`、`pr-closed`，它们在 PR 预检之前就完成渲染）；dry-run、releases-only、渲染前失败不带。
+- `internal/app`：`Result` 新增 `DigestPath`，渲染后从产物里认出本期 digest。
+- `cmd/trendradar`：`run --json` 新增 `digest` 字段（`digestArtifact`），复用与 `files` 同一份
+  字节计算 sha，不再需要调用方二次读盘。
+
+### 兼容性
+- **破坏性**：`ipcSchema` 2 → 3（`digestSchema` 保持 2）。新旧核心/插件不能混搭，插件握手会直接
+  拒绝；插件侧随 0.9.0 升级契约依赖与预览实现。
+- `digests/` 目录布局、`contentHash`、`files` 形状均不变。
+
 ## 0.8.7
 
 ### Fixed — 降级告警只说「哪个语言失败」，不说「为什么」

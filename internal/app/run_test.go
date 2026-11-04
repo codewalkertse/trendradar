@@ -18,6 +18,7 @@ import (
 	"github.com/morehao/trendradar/internal/config"
 	"github.com/morehao/trendradar/internal/digest"
 	"github.com/morehao/trendradar/internal/enrich"
+	"github.com/morehao/trendradar/internal/fetch"
 	"github.com/morehao/trendradar/internal/gitx"
 	"github.com/morehao/trendradar/internal/ipc"
 	"github.com/morehao/trendradar/internal/model"
@@ -222,6 +223,11 @@ type fakePR struct {
 	// latestAfterCreate, when set, is what FindForBranch returns once a PR has
 	// been created — lets a test model "the new PR exists in some state".
 	latestAfterCreate *pr.Pull
+	// get, when set, is what Get returns (a freshly read PR with a settled
+	// mergeable flag). Nil models "GitHub has not computed mergeable yet".
+	get       *pr.Pull
+	getErr    error
+	mergeErrs []error
 }
 
 func (f *fakePR) FindOpen(context.Context, string, string) (*pr.Pull, error) { return f.existing, nil }
@@ -231,6 +237,7 @@ func (f *fakePR) FindForBranch(context.Context, string, string) (*pr.Pull, error
 	}
 	return f.latest, nil
 }
+func (f *fakePR) Get(context.Context, int) (*pr.Pull, error) { return f.get, f.getErr }
 func (f *fakePR) Create(context.Context, string, string, string, string) (*pr.Pull, error) {
 	f.creates++
 	if f.createdErr != nil {
@@ -248,6 +255,13 @@ func (f *fakePR) UpdateBody(_ context.Context, _ int, _ string) (*pr.Pull, error
 	return f.existing, nil
 }
 func (f *fakePR) Merge(_ context.Context, n int) error {
+	if len(f.mergeErrs) > 0 {
+		err := f.mergeErrs[0]
+		f.mergeErrs = f.mergeErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
 	f.merged = append(f.merged, n)
 	return nil
 }
@@ -413,6 +427,11 @@ func TestMergedPRSkipsScheduledRun(t *testing.T) {
 	}
 	if got := countRef(t, remote, "trending/daily/2026-10-30"); got != 0 {
 		t.Fatalf("unexpected branch pushed for merged date: %d commits", got)
+	}
+	// Rendering happens before the PR pre-check, so even a merged/scheduled skip
+	// carries the (unchanged) digest. The plugin refreshes its preview with it.
+	if r.DigestPath != "digests/daily/2026-10/2026-10-30.md" {
+		t.Fatalf("merged skip DigestPath = %q", r.DigestPath)
 	}
 }
 
@@ -831,4 +850,385 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// The digest bytes must be addressable from the Result itself: the CLI inlines
+// them into RunResult (ipc v3) so consumers never read the output repository.
+func TestRunExposesDigestPath(t *testing.T) {
+	_, _, cfg := setupRepo(t)
+	in := fixtureInputs()
+
+	r, err := Run(context.Background(), cfg, in, Options{Provider: model.NewFake()})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	const want = "digests/daily/2026-10/2026-10-30.md"
+	if r.DigestPath != want {
+		t.Fatalf("DigestPath = %q, want %q", r.DigestPath, want)
+	}
+	var data []byte
+	for _, f := range r.Files {
+		if f.Path == want {
+			data = f.Data
+		}
+	}
+	if len(data) == 0 {
+		t.Fatalf("digest file %q missing from Files", want)
+	}
+	if !strings.Contains(string(data), "## all") && !strings.Contains(string(data), "## go") {
+		t.Fatalf("digest body does not look like markdown:\n%s", data)
+	}
+
+	// An unchanged rerun is skipped, but it still rendered the same artifacts:
+	// the digest must remain addressable (the plugin refreshes its preview).
+	r2, err := Run(context.Background(), cfg, in, Options{Provider: model.NewFake()})
+	if err != nil {
+		t.Fatalf("rerun: %v", err)
+	}
+	if !r2.Skipped {
+		t.Fatal("second run should be skipped")
+	}
+	if r2.DigestPath != want {
+		t.Fatalf("skipped rerun DigestPath = %q, want %q", r2.DigestPath, want)
+	}
+}
+
+// Weekly/monthly use different bucket/name rules (ISO year + YYYY-Wnn, YYYY + YYYY-MM);
+// the suffix match must keep picking the digest itself, not index.md.
+func TestRunExposesDigestPathForWeeklyAndMonthly(t *testing.T) {
+	cases := []struct {
+		period string
+		date   string
+		want   string
+	}{
+		{"weekly", "2026-11-01", "digests/weekly/2026/2026-W44.md"},
+		{"monthly", "2026-10-31", "digests/monthly/2026/2026-10.md"},
+	}
+	for _, tc := range cases {
+		_, _, cfg := setupRepo(t)
+		in := fixtureInputs()
+		in.Date = tc.date
+		in.Period = tc.period
+		r, err := Run(context.Background(), cfg, in, Options{Provider: model.NewFake()})
+		if err != nil {
+			t.Fatalf("%s run: %v", tc.period, err)
+		}
+		if r.DigestPath != tc.want {
+			t.Fatalf("%s DigestPath = %q, want %q", tc.period, r.DigestPath, tc.want)
+		}
+	}
+}
+
+// A manual regenerate of a date whose PR was already merged must rebuild the
+// branch from base, not append to the spent branch: main holds a squash-merged
+// copy, so appending keeps the old base and the new PR can never merge.
+func TestManualRebuildResetsSpentBranchToBase(t *testing.T) {
+	remote, _, cfg := setupRepo(t)
+	cfg.PR = config.PRConfig{Enabled: true, AutoMerge: false}
+
+	first, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake()})
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if first.Commit == "" {
+		t.Fatal("first run did not commit")
+	}
+	oldCommit := first.Commit
+
+	mergedAt := time.Now()
+	created := &pr.Pull{Number: 9, HTMLURL: "https://github.com/acme/widgets/pull/9"}
+	fake := &fakePR{
+		latest:  &pr.Pull{Number: 5, State: "closed", MergedAt: &mergedAt},
+		created: created,
+	}
+	withPRClient(t, fake)
+
+	in := fixtureInputs()
+	in.Repos = append(in.Repos, digest.RepoSnapshot{
+		FullName: "acme/three", URL: "https://github.com/acme/three", Description: digest.StrPtr("third"),
+		Language: "go", Stars: 300, StarsInPeriod: 30, Forks: digest.IntPtr(6), Rank: 3, Source: digest.SourceTrendingHTML,
+	})
+	r, err := Run(context.Background(), cfg, in, Options{Provider: model.NewFake(), Token: "tok", Trigger: TriggerManual})
+	if err != nil {
+		t.Fatalf("manual rebuild: %v", err)
+	}
+	if r.Skipped {
+		t.Fatalf("manual rebuild must not skip, got %q", r.SkipReason)
+	}
+	if fake.creates != 1 || r.PRURL != created.HTMLURL {
+		t.Fatalf("expected a fresh PR, creates=%d url=%q", fake.creates, r.PRURL)
+	}
+	// The spent branch's commit must be gone: the rebuilt branch starts at base.
+	if isAncestor(t, remote, oldCommit, "refs/heads/trending/daily/2026-10-30") {
+		t.Fatal("rebuilt branch still contains the old (spent) commit; it was appended, not reset")
+	}
+}
+
+// An open PR's branch is still in flight: a manual rerun keeps appending so the
+// PR history (and any human review context) is preserved.
+func TestManualRerunKeepsAppendingWhenPROpen(t *testing.T) {
+	remote, _, cfg := setupRepo(t)
+	cfg.PR = config.PRConfig{Enabled: true, AutoMerge: false}
+
+	first, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake()})
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	before := countRef(t, remote, "trending/daily/2026-10-30")
+
+	open := &pr.Pull{Number: 7, State: "open", HTMLURL: "https://github.com/acme/widgets/pull/7"}
+	withPRClient(t, &fakePR{latest: open, existing: open})
+	in := fixtureInputs()
+	in.Repos = append(in.Repos, digest.RepoSnapshot{
+		FullName: "acme/three", URL: "https://github.com/acme/three", Description: digest.StrPtr("third"),
+		Language: "go", Stars: 300, StarsInPeriod: 30, Forks: digest.IntPtr(6), Rank: 3, Source: digest.SourceTrendingHTML,
+	})
+	if _, err := Run(context.Background(), cfg, in, Options{Provider: model.NewFake(), Token: "tok", Trigger: TriggerManual}); err != nil {
+		t.Fatalf("manual rerun: %v", err)
+	}
+	if after := countRef(t, remote, "trending/daily/2026-10-30"); after != before+1 {
+		t.Fatalf("open PR branch should append one commit: before=%d after=%d", before, after)
+	}
+	if !isAncestor(t, remote, first.Commit, "refs/heads/trending/daily/2026-10-30") {
+		t.Fatal("open PR branch lost its previous commit")
+	}
+}
+
+// Regression: the release stage used to overwrite the trending digest's
+// date/period with the release document's week end, which leaked into the PR
+// title ("monthly" runs titled as weekly PRs for the following Sunday) and into
+// Result.Digest.
+func TestReleaseStageDoesNotRewriteTrendingDigest(t *testing.T) {
+	_, _, cfg := setupRepo(t)
+	cfg.Releases = config.ReleasesConfig{Enabled: true, Period: "weekly", Timezone: "Asia/Shanghai"}
+	dir := t.TempDir()
+	r, err := Run(context.Background(), cfg, fixtureInputs(), Options{
+		Provider: model.NewFake(),
+		Releases: &ReleasesOptions{
+			Repos:     []string{"acme/one"},
+			Fetcher:   emptyReleaseFetcher{},
+			StatePath: filepath.Join(dir, "release-state.json"),
+			CachePath: filepath.Join(dir, "release-cache.json"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if r.Digest.Date != "2026-10-30" || r.Digest.Period != "daily" {
+		t.Fatalf("release stage rewrote the trending digest: date=%q period=%q", r.Digest.Date, r.Digest.Period)
+	}
+}
+
+// emptyReleaseFetcher reports no releases/tags; it only exists so the release
+// stage runs (and used to overwrite the digest) without touching the network.
+type emptyReleaseFetcher struct{}
+
+func (emptyReleaseFetcher) ListReleasesPage(context.Context, string, string, int, int) (fetch.ReleasePage, error) {
+	return fetch.ReleasePage{}, nil
+}
+
+func (emptyReleaseFetcher) ListTagsPage(context.Context, string, string, int, int) (fetch.TagPage, error) {
+	return fetch.TagPage{}, nil
+}
+
+func (emptyReleaseFetcher) GetCommit(context.Context, string, string, string) (fetch.Commit, error) {
+	return fetch.Commit{}, nil
+}
+
+// isAncestor reports whether commit is reachable from ref in the bare remote.
+func isAncestor(t *testing.T, remote, commit, ref string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "--git-dir", remote, "merge-base", "--is-ancestor", commit, ref)
+	return cmd.Run() == nil
+}
+
+// Regression (A): the local base checkout must be fast-forwarded before the
+// index is rendered. Between runs the automation only switches back to base (or
+// ends on a merged-PR skip) and never pulls, while the remote base keeps moving
+// as merged PRs land. Reading a stale base makes ListDigests miss every date
+// merged since the last sync, so index.md silently loses already-shipped rows.
+// This test advances origin/main behind the local checkout's back and asserts the
+// next run still renders both dates into index.md.
+func TestStaleBaseStillRendersMergedDatesInIndex(t *testing.T) {
+	remote, work, cfg := setupRepo(t)
+
+	// Day 1: a normal run on a date branch. It is not auto-merged, so the run
+	// ends by switching back to base but leaves the date branch checked out
+	// nowhere — cleanup is skipped because the PR is not merged.
+	if _, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake()}); err != nil {
+		t.Fatalf("day 1 run: %v", err)
+	}
+
+	// Simulate another machine merging day 1's PR into main: check out the day-1
+	// branch, add the index commit it would have produced, and push it to main.
+	// Then return the local checkout to base WITHOUT pulling — exactly the state
+	// a completed automation loop leaves behind.
+	day1 := "trending/daily/2026-10-30"
+	runGit(t, work, "fetch", "origin")
+	runGit(t, work, "switch", "-C", "sim-merge", "origin/"+day1)
+	// The branch carries the digest artifacts; commit them onto main to model a
+	// squash merge of the PR.
+	runGit(t, work, "push", "origin", "sim-merge:main")
+	runGit(t, work, "switch", "main")
+
+	// Local main is now behind the remote (which has day 1's files). The old
+	// behaviour would render day 2 against this stale tree and lose day 1.
+	if got := countRef(t, remote, "main"); got == 0 {
+		t.Fatal("remote main unexpectedly empty")
+	}
+
+	// Day 2: a different date. The start-of-run base sync must ff-only main so the
+	// history scan sees day 1's files and index.md keeps its row.
+	in2 := fixtureInputs()
+	in2.Date = "2026-10-31"
+	if _, err := Run(context.Background(), cfg, in2, Options{Provider: model.NewFake()}); err != nil {
+		t.Fatalf("day 2 run: %v", err)
+	}
+
+	idx, err := os.ReadFile(filepath.Join(work, "digests", "index.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(idx)
+	if !strings.Contains(body, "2026-10-30") {
+		t.Fatalf("index.md lost the already-merged 2026-10-30 row after a stale-base run:\n%s", body)
+	}
+	if !strings.Contains(body, "2026-10-31") {
+		t.Fatalf("index.md missing the new 2026-10-31 row:\n%s", body)
+	}
+}
+
+// installNoForceHook installs a pre-receive hook on the bare remote that rejects
+// any force update of an existing branch (a non-fast-forward that is not a
+// delete), while still allowing branch deletion and plain fast-forward pushes.
+// This models a remote policy where force-push is forbidden but delete+recreate
+// is fine — the exact situation the manual rebuild must survive.
+func installNoForceHook(t *testing.T, remote string) {
+	t.Helper()
+	hook := filepath.Join(remote, "hooks", "pre-receive")
+	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `#!/bin/sh
+# Reject force (non-fast-forward) updates; allow deletes and fast-forwards.
+rc=0
+while read old new ref; do
+  # delete: new is all zeros — allow.
+  case "$new" in 0000000000000000000000000000000000000000*) continue;; esac
+  # create: old is all zeros — allow.
+  case "$old" in 0000000000000000000000000000000000000000*) continue;; esac
+  if ! git merge-base --is-ancestor "$old" "$new"; then
+    echo "force-push is forbidden on this remote ($ref)" >&2
+    rc=1
+  fi
+done
+exit $rc
+`
+	if err := os.WriteFile(hook, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Regression (B): a manual rebuild of a spent branch must delete the remote
+// branch and recreate it from base with a plain push, so it succeeds even on a
+// remote that forbids force-push. The previous implementation force-with-leased
+// over the spent branch, which this remote rejects.
+func TestManualRebuildSucceedsOnNoForceRemote(t *testing.T) {
+	remote, _, cfg := setupRepo(t)
+	cfg.PR = config.PRConfig{Enabled: true, AutoMerge: false}
+	dateBranch := "trending/daily/2026-10-30"
+
+	// Seed the spent branch with a normal run.
+	first, err := Run(context.Background(), cfg, fixtureInputs(), Options{Provider: model.NewFake()})
+	if err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	oldCommit := first.Commit
+	installNoForceHook(t, remote)
+
+	mergedAt := time.Now()
+	fake := &fakePR{
+		latest:            &pr.Pull{Number: 5, State: "closed", MergedAt: &mergedAt},
+		created:           &pr.Pull{Number: 9, HTMLURL: "https://github.com/acme/widgets/pull/9"},
+		latestAfterCreate: &pr.Pull{Number: 9, State: "open"},
+	}
+	withPRClient(t, fake)
+
+	// Manual regenerate with changed content must rebuild the spent branch.
+	in2 := fixtureInputs()
+	in2.Repos[0].Stars += 50
+	r, err := Run(context.Background(), cfg, in2, Options{Provider: model.NewFake(), Token: "tok", Trigger: TriggerManual})
+	if err != nil {
+		t.Fatalf("manual rebuild on no-force remote: %v", err)
+	}
+	if r.Skipped {
+		t.Fatalf("manual rebuild must not skip, got %q", r.SkipReason)
+	}
+	if r.PRURL != fake.created.HTMLURL {
+		t.Fatalf("PRURL = %q, want %q", r.PRURL, fake.created.HTMLURL)
+	}
+	// The rebuilt branch exists, descends from main, and no longer contains the
+	// old spent commit — proof it was deleted and recreated, not force-rewound.
+	newHead := refSHA(t, remote, dateBranch)
+	if !isAncestor(t, remote, refSHA(t, remote, "main"), newHead) {
+		t.Fatal("rebuilt branch does not descend from main")
+	}
+	if isAncestor(t, remote, oldCommit, newHead) {
+		t.Fatal("rebuilt branch still contains the old spent commit")
+	}
+}
+
+// Regression (C): when GitHub reports a PR is not mergeable, openPR must not
+// fire PUT /merge (which would 405 and be reported as a failure). It must leave
+// the PR open and return a NOT_MERGEABLE warning carrying the reason, so the
+// plugin can tell the user to look at the PR instead of seeing a red run.
+func TestOpenPRSkipsMergeWhenNotMergeable(t *testing.T) {
+	notMergeable := false
+	fake := &fakePR{
+		created: &pr.Pull{Number: 11, HTMLURL: "https://github.com/acme/widgets/pull/11"},
+		get:     &pr.Pull{Number: 11, State: "open", Mergeable: &notMergeable, MergeableState: "dirty"},
+	}
+	cfg := &config.Config{
+		Repo: config.RepoConfig{Remote: "origin", BaseBranch: "main"},
+		PR:   config.PRConfig{Enabled: true, AutoMerge: true},
+	}
+	url, err := openPR(context.Background(), fake, cfg, "trending/daily/2026-10-30", digest.Digest{Date: "2026-10-30", Count: 3})
+	if url != fake.created.HTMLURL {
+		t.Fatalf("url = %q, want %q", url, fake.created.HTMLURL)
+	}
+	if len(fake.merged) != 0 {
+		t.Fatalf("Merge must not be called when not mergeable, merged=%v", fake.merged)
+	}
+	var ei *ipc.ErrorInfo
+	if !errors.As(err, &ei) || ei.Code != ipc.CodeNotMergeable {
+		t.Fatalf("err = %v, want NOT_MERGEABLE warning", err)
+	}
+	if !strings.Contains(err.Error(), "dirty") {
+		t.Fatalf("warning should carry mergeable_state, got %q", err.Error())
+	}
+}
+
+// Regression (C): an existing open PR that is not mergeable must likewise be
+// left open without a merge attempt.
+func TestOpenPRExistingNotMergeableLeftOpen(t *testing.T) {
+	notMergeable := false
+	fake := &fakePR{
+		existing: &pr.Pull{Number: 9, HTMLURL: "https://github.com/acme/widgets/pull/9"},
+		get:      &pr.Pull{Number: 9, State: "open", Mergeable: &notMergeable, MergeableState: "blocked"},
+	}
+	cfg := &config.Config{
+		Repo: config.RepoConfig{Remote: "origin", BaseBranch: "main"},
+		PR:   config.PRConfig{Enabled: true, AutoMerge: true},
+	}
+	url, err := openPR(context.Background(), fake, cfg, "trending/daily/2026-10-30", digest.Digest{Date: "2026-10-30", Count: 1})
+	if url != fake.existing.HTMLURL {
+		t.Fatalf("url = %q, want %q", url, fake.existing.HTMLURL)
+	}
+	if len(fake.merged) != 0 {
+		t.Fatalf("Merge must not be called when not mergeable, merged=%v", fake.merged)
+	}
+	var ei *ipc.ErrorInfo
+	if !errors.As(err, &ei) || ei.Code != ipc.CodeNotMergeable {
+		t.Fatalf("err = %v, want NOT_MERGEABLE warning", err)
+	}
 }
